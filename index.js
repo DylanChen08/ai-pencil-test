@@ -2,8 +2,10 @@ import "dotenv/config";
 import OpenAI from "openai";
 import readline from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
-import { appendFile, readFile } from "node:fs/promises";
+import { appendFile, readFile, mkdir } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 const provider = (process.env.PROVIDER || "dashscope").toLowerCase();
 
@@ -39,7 +41,103 @@ const openai = new OpenAI({
 const HISTORY_FILE = process.env.HISTORY_FILE || "./chat-history.jsonl";
 const MAX_CONTEXT_ROUNDS = Number(process.env.MAX_CONTEXT_ROUNDS || 10);
 const SYSTEM_PROMPT =
-  process.env.SYSTEM_PROMPT || "你是一个专业、简洁、友好的 AI 助手。";
+  process.env.SYSTEM_PROMPT ||
+  "你是一个专业、简洁、友好的 AI 助手。若用户需要创建目录，可调用 create_folder，relativePath 必须为相对项目根目录的路径。";
+
+const __filename = fileURLToPath(import.meta.url);
+const PROJECT_ROOT = path.resolve(path.dirname(__filename));
+
+const TOOLS = [
+  {
+    type: "function",
+    function: {
+      name: "create_folder",
+      description:
+        "在当前项目根目录下创建文件夹（支持多级）。仅允许相对路径，禁止跳出项目根目录。",
+      parameters: {
+        type: "object",
+        properties: {
+          relativePath: {
+            type: "string",
+            description: "相对项目根目录的路径，例如 notes 或 a/b/c",
+          },
+        },
+        required: ["relativePath"],
+      },
+    },
+  },
+];
+
+function safeResolveUnderRoot(relativePath) {
+  const raw = String(relativePath ?? "").trim();
+  const normalized = path.normalize(raw);
+  if (!raw) throw new Error("路径不能为空");
+  if (path.isAbsolute(normalized)) throw new Error("不允许使用绝对路径");
+
+  const target = path.resolve(PROJECT_ROOT, normalized);
+  const rel = path.relative(PROJECT_ROOT, target);
+  if (rel.startsWith("..") || path.isAbsolute(rel)) {
+    throw new Error("路径不允许超出项目根目录");
+  }
+  if (rel === "") throw new Error("请指定子目录名称，不要操作项目根本身");
+
+  return target;
+}
+
+async function runCreateFolder(relativePath) {
+  const target = safeResolveUnderRoot(relativePath);
+  await mkdir(target, { recursive: true });
+  return { ok: true, created: path.relative(PROJECT_ROOT, target) };
+}
+
+async function consumeStream(stream) {
+  let content = "";
+  const toolBuffers = new Map();
+
+  for await (const chunk of stream) {
+    const delta = chunk.choices?.[0]?.delta;
+    if (delta?.content) {
+      content += delta.content;
+      process.stdout.write(delta.content);
+    }
+    if (delta?.tool_calls?.length) {
+      for (const tc of delta.tool_calls) {
+        const idx = tc.index ?? 0;
+        if (!toolBuffers.has(idx)) {
+          toolBuffers.set(idx, { id: "", name: "", arguments: "" });
+        }
+        const b = toolBuffers.get(idx);
+        if (tc.id) b.id = tc.id;
+        if (tc.function?.name) b.name += tc.function.name;
+        if (tc.function?.arguments) b.arguments += tc.function.arguments;
+      }
+    }
+  }
+
+  const tool_calls = Array.from(toolBuffers.entries())
+    .sort((a, b) => a[0] - b[0])
+    .map(([, b]) => ({
+      id: b.id,
+      type: "function",
+      function: {
+        name: b.name,
+        arguments: b.arguments || "{}",
+      },
+    }))
+    .filter((tc) => tc.id && tc.function.name);
+
+  return { content, tool_calls };
+}
+
+function lastAssistantText(messages) {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (m.role === "assistant" && typeof m.content === "string" && m.content) {
+      return m.content;
+    }
+  }
+  return "";
+}
 
 async function getUserPrompt(rl) {
   const cliPrompt = process.argv.slice(2).join(" ").trim();
@@ -123,37 +221,77 @@ async function runChat() {
       }
 
       const userMessage = { role: "user", content: userInput };
-      const trimmedContext = sessionMessages.slice(-MAX_CONTEXT_ROUNDS * 2);
+      const trimmedContext = sessionMessages.slice(-MAX_CONTEXT_ROUNDS * 4);
       const requestMessages = [
         { role: "system", content: SYSTEM_PROMPT },
         ...trimmedContext,
         userMessage,
       ];
 
-      const stream = await openai.chat.completions.create({
-        model: current.model,
-        messages: requestMessages,
-        temperature: 0.7,
-        stream: true,
-      });
+      const msgsForApi = [...requestMessages];
+      const newMessagesThisTurn = [];
+      let round = 0;
 
-      let assistantReply = "";
       console.log("AI: ");
-      for await (const chunk of stream) {
-        // 打印每个流式分片的原始数据，便于调试
-        // console.log("\n[Raw Chunk]");
-        // console.dir(chunk, { depth: null, colors: true });
+      while (true) {
+        const stream = await openai.chat.completions.create({
+          model: current.model,
+          messages: msgsForApi,
+          temperature: 0.7,
+          stream: true,
+          tools: TOOLS,
+          tool_choice: "auto",
+        });
 
-        const delta = chunk.choices?.[0]?.delta?.content || "";
-        if (delta) {
-          process.stdout.write(delta);
-          assistantReply += delta;
+        const { content, tool_calls } = await consumeStream(stream);
+
+        if (!tool_calls.length) {
+          const assistantMsg = { role: "assistant", content: content };
+          msgsForApi.push(assistantMsg);
+          newMessagesThisTurn.push(assistantMsg);
+          break;
+        }
+
+        const assistantMsg = {
+          role: "assistant",
+          content: content || null,
+          tool_calls,
+        };
+        msgsForApi.push(assistantMsg);
+        newMessagesThisTurn.push(assistantMsg);
+
+        for (const tc of tool_calls) {
+          let result;
+          try {
+            const args = JSON.parse(tc.function.arguments || "{}");
+            if (tc.function.name === "create_folder") {
+              result = await runCreateFolder(args.relativePath);
+            } else {
+              result = { ok: false, error: `未知工具: ${tc.function.name}` };
+            }
+          } catch (e) {
+            result = { ok: false, error: String(e?.message || e) };
+          }
+          const toolMsg = {
+            role: "tool",
+            tool_call_id: tc.id,
+            content: JSON.stringify(result),
+          };
+          msgsForApi.push(toolMsg);
+          newMessagesThisTurn.push(toolMsg);
+        }
+
+        round += 1;
+        if (round > 8) {
+          console.error("\n工具调用次数过多，已中止本轮。");
+          break;
         }
       }
+
       console.log("\n");
-      const assistantMessage = { role: "assistant", content: assistantReply };
-      sessionMessages.push(userMessage, assistantMessage);
-      sessionMessages = sessionMessages.slice(-MAX_CONTEXT_ROUNDS * 2);
+      const assistantReply = lastAssistantText(newMessagesThisTurn);
+      sessionMessages.push(userMessage, ...newMessagesThisTurn);
+      sessionMessages = sessionMessages.slice(-MAX_CONTEXT_ROUNDS * 4);
 
       const baseHistory = {
         sessionId,
